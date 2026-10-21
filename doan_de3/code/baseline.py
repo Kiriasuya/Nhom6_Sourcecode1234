@@ -23,23 +23,19 @@ p.add_argument("--seed", type=int, default=42)
 args = p.parse_args()
 os.makedirs(args.out, exist_ok=True)
 rng = np.random.RandomState(args.seed)
-
 df = pd.read_csv(args.data, encoding="utf-8-sig", keep_default_na=False)
 S = {s: df[df.split == s].reset_index(drop=True) for s in ("train", "val", "test", "ood")}
-
-# dac trung: tu (1-2 gram) + ky tu (2-5 gram, chiu duoc cau thieu dau); chi fit tren train 
+# ---------- dac trung: tu (1-2 gram) + ky tu (2-5 gram, chiu duoc cau thieu dau); chi fit tren train
 wv = TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True).fit(S["train"].text)
 cv = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), sublinear_tf=True, min_df=2).fit(S["train"].text)
 feat = lambda t: hstack([wv.transform(t), cv.transform(t)]).tocsr()
 X = {s: feat(d.text) for s, d in S.items()}
 TASKS = {"topic": "primary_topic", "sentiment": "sentiment", "priority": "priority", "multilabel": "topics"}
 split_t = lambda s: [t.strip() for t in s.split(";")]
-
 def oversample(x, y):  # nhan ban ngau nhien mau lop thieu cho bang lop lon nhat (chi tren train)
     cnt = np.bincount(y); idx = np.concatenate([rng.choice(np.where(y == k)[0], cnt.max()) for k in range(len(cnt)) if cnt[k]])
     return x[idx], y[idx]
-
-def macro(y, pred, multilabel):  # multilabel chi tinh nhan co mau trong tap danh gia
+def macro(y, pred, multilabel):  # multilabel: chi tinh nhan co mau trong tap danh gia
     if not multilabel: return f1_score(y, pred, average="macro", zero_division=0)
     sup = y.sum(0) > 0; return f1_score(y[:, sup], pred[:, sup], average="macro", zero_division=0)
 rows, best_models = [], {}
@@ -80,13 +76,11 @@ for task, col in TASKS.items():
             rows.append(r)
         if best is None or v > best[0]: best = (v, m, model, balance)
     best_models[task] = (best[1], classes, f"{best[2]}+{best[3]}")
-
 res = pd.DataFrame(rows); res.round(4).to_csv(f"{args.out}/results_baseline.csv", index=False, encoding="utf-8-sig")
 pd.set_option("display.width", 220)
-print("Ket qua tren test"); print(res[res.split == "test"].drop(columns=["split", "train_sec"]).round(3).to_string(index=False))
-print("\nKet qua tren OOD (14 mau, chi tham khao)"); print(res[res.split == "ood"][["task", "model", "balance", "macro_f1", "micro_f1"]].round(3).to_string(index=False))
-
-# confusion matrix + per-class (mo hinh tot nhat tren val, tap test)
+print("=== KET QUA TREN TEST ==="); print(res[res.split == "test"].drop(columns=["split", "train_sec"]).round(3).to_string(index=False))
+print("\n=== KET QUA TREN OOD (14 mau, chi tham khao) ==="); print(res[res.split == "ood"][["task", "model", "balance", "macro_f1", "micro_f1"]].round(3).to_string(index=False))
+# ---------- confusion matrix + per-class (mo hinh tot nhat tren val, tap test)
 for task, col in TASKS.items():
     if task == "multilabel": continue
     m, classes, name = best_models[task]; y = np.array([classes.index(v) for v in S["test"][col]]); pr = m.predict(X["test"])
