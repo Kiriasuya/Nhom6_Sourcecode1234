@@ -1,4 +1,4 @@
-"""BiLSTM cho phan loai phan hoi sinh vien (multiclass / multilabel) + tinh chinh hyperparameter.
+"""BiLSTM cho phan loai phan hoi sinh vien (multiclass hoac multilabel) + tinh chinh hyperparameter.
 Du lieu CSV, cot:
   text        noi dung phan hoi (bat buoc)
   topic       nhan don vi tiep nhan. Multiclass: 1 nhan. Multilabel: nhieu nhan cach nhau boi ';'
@@ -14,7 +14,6 @@ import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as 
 from collections import Counter
 from sklearn.metrics import f1_score, precision_recall_fscore_support, confusion_matrix
 from sklearn.model_selection import train_test_split
-
 p = argparse.ArgumentParser()
 p.add_argument("--data", required=True)
 p.add_argument("--topic_col", default="topic", help="cot nhan don vi (vd: primary_topic cho multiclass, topics cho multilabel)")
@@ -29,21 +28,20 @@ p.add_argument("--gamma", type=float, default=2.0, help="focal loss gamma")
 p.add_argument("--seed", type=int, default=42)
 p.add_argument("--out", default="runs")
 args = p.parse_args()
-
 random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs(args.out, exist_ok=True)
 
-# Data
+# 1. Du lieu
 df = pd.read_csv(args.data).rename(columns={args.topic_col: "topic"}).dropna(subset=["text", "topic"])
-df = df[~df.text.str.lower().str.strip().duplicated()].reset_index(drop=True)  # khu trung lap sau chuan hoa
+if "split" not in df: df = df[~df.text.str.lower().str.strip().duplicated()].reset_index(drop=True)  # khu trung lap (file da co split thi build_final_data.py da khu)
 df["topic"] = df.topic.astype(str).str.replace(r"\s*;\s*", ";", regex=True).str.strip()
 if "split" not in df:  # chia sau khi khu trung lap de tranh ro ri du lieu
     first = df.topic.str.split(";").str[0]; first = first.where(first.map(first.value_counts()) >= 10, "_rare")  # gop lop qua hiem de stratify
     tr, rest = train_test_split(df.index, test_size=0.2, stratify=first, random_state=args.seed)
     va, te = train_test_split(rest, test_size=0.5, stratify=first[rest], random_state=args.seed)
     df["split"] = "train"; df.loc[va, "split"] = "val"; df.loc[te, "split"] = "test"
-tok = lambda s: re.findall(r"\w+", str(s).lower())  # muc am tiet
+tok = lambda s: re.findall(r"\w+", str(s).lower())  # muc am tiet (tieng Viet tach theo dau cach)
 vocab = {"<pad>": 0, "<unk>": 1}
 for w, c in Counter(w for s in df[df.split == "train"].text for w in tok(s)).items():
     if c >= 2: vocab[w] = len(vocab)
@@ -53,6 +51,7 @@ def encode(texts):
     for i, s in enumerate(texts):
         ids = [vocab.get(w, 1) for w in tok(s)][:MAXLEN]; x[i, :len(ids)] = ids
     return torch.tensor(x)
+
 topics = sorted({t for s in df.topic.astype(str) for t in s.split(";")})
 tix = {t: i for i, t in enumerate(topics)}
 def topic_y(col):
@@ -64,7 +63,6 @@ def topic_y(col):
 aux = {}  # head phu: ten -> danh sach lop
 for name in ("sentiment", "priority"):
     if name in df: aux[name] = sorted(df[name].dropna().astype(str).unique())
-
 def build(split):
     d = df[df.split == split]
     y = {"topic": topic_y(d.topic)}
@@ -73,7 +71,7 @@ def build(split):
     return encode(d.text.tolist()), y, d
 data = {s: build(s) for s in ("train", "val", "test", "ood")}
 
-# Model
+# 2. Mo hinh
 class Net(nn.Module):
     def __init__(self, emb, hid, drop):
         super().__init__()
@@ -88,11 +86,13 @@ class Net(nn.Module):
         mean = (h * mask).sum(1) / mask.sum(1).clamp(min=1)
         z = self.drop(torch.cat([mx, mean], -1))
         return {n: h(z) for n, h in self.heads.items()}
-
 def class_weights(y, n):  # nghich dao tan suat, chuan hoa trung binh = 1
     cnt = torch.bincount(y[y >= 0], minlength=n).float().clamp(min=1)
     return (cnt.sum() / (n * cnt)).to(dev)
 def focal(logits, y, w, gamma):  # FL = -alpha_t (1 - p_t)^gamma log p_t
+    ok = y >= 0  # bo mau thieu nhan (-100) cua tac vu phu
+    if not ok.any(): return logits.sum() * 0
+    logits, y = logits[ok], y[ok]
     logp = F.log_softmax(logits, -1).gather(1, y[:, None]).squeeze(1)
     a = w[y] if w is not None else 1.0
     return (-a * (1 - logp.exp()) ** gamma * logp).mean()
@@ -116,7 +116,7 @@ def make_loss(ytr):
         return lt + args.aux_weight * la
     return loss
 
-# Train / danh gia
+# 3. Huan luyen / danh gia
 def to_dev(y): return {k: v.to(dev) for k, v in y.items()}
 @torch.no_grad()
 def predict(model, x, bs=256):
@@ -149,7 +149,6 @@ def train(cfg):
             bad += 1
             if bad >= args.patience: break
     model.load_state_dict(best[1]); return model, best[0], best[2]
-
 base = {"emb": 128, "hid": 128, "drop": 0.4, "lr": 2e-3, "bs": 32}
 grid = {"emb": [100, 200], "hid": [64, 128], "drop": [0.3, 0.5], "lr": [1e-3, 3e-3]} if args.tune else {}
 cfgs = [dict(base, **dict(zip(grid, v))) for v in itertools.product(*grid.values())] if grid else [base]
@@ -161,13 +160,16 @@ for cfg in cfgs:
     if best is None or f1 > best[1]: best = (m, f1, thr, cfg)
 model, val_f1, thr, cfg = best
 
-# Danh gia test va ood su dung du lieu thu thap tay, ngoai phan phoi
+# 4. Danh gia: test va ood (du lieu thu thap tay, ngoai phan phoi)
 def evaluate(split):
     x, y, _ = data[split]
     if len(x) == 0: return None, None
     out = predict(model, x); yt = y["topic"].numpy(); pt = topic_pred(out["topic"], thr)
     r = {"n": len(x), **{f"{a}_f1": f1_score(yt, pt, average=a, zero_division=0) for a in ("macro", "micro", "weighted")},
          "per_class_f1": dict(zip(topics, f1_score(yt, pt, average=None, zero_division=0).round(4).tolist()))}
+    if args.mode == "multilabel":  # bao cao rieng mau don nhan va da nhan
+        mu = yt.sum(1) > 1
+        for nm, k in (("single", ~mu), ("multi", mu)): r[f"micro_f1_{nm}"] = f1_score(yt[k], pt[k], average="micro", zero_division=0) if k.any() else None; r[f"n_{nm}"] = int(k.sum())
     for n, cls in aux.items():
         ya, pa = y[n].numpy(), out[n].argmax(1).numpy(); ok = ya >= 0
         r[f"{n}_macro_f1"] = f1_score(ya[ok], pa[ok], average="macro", zero_division=0)
@@ -184,6 +186,7 @@ with torch.no_grad():  # do tre tung mau: token hoa + ma hoa + suy luan
     for t in texts[:200]:
         t0 = time.perf_counter(); model(encode([t]).to(dev)); lat.append((time.perf_counter() - t0) * 1000)
 res["latency_ms_mean"] = float(np.mean(lat)); res["n_params"] = sum(p.numel() for p in model.parameters()); res["trials"] = trials
+
 tag = f"bilstm_{args.mode}_{args.loss}"
 json.dump(res, open(f"{args.out}/{tag}.json", "w"), ensure_ascii=False, indent=2)
 torch.save({"state": model.state_dict(), "vocab": vocab, "topics": topics, "aux": aux, "cfg": cfg, "thr": thr, "arch": "bilstm", "mode": args.mode}, f"{args.out}/{tag}.pt")
